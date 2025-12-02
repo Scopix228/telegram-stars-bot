@@ -8,33 +8,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Health check для Railway (ВАЖНО!)
+const TOKEN = process.env.TOKEN;
+const ADMIN_ID = process.env.ADMIN_ID;
+const PORT = process.env.PORT || 3000;
+
+console.log('🚀 Проверка переменных окружения...');
+console.log('TOKEN:', TOKEN ? 'Есть' : 'Нет');
+console.log('ADMIN_ID:', ADMIN_ID || 'Не установлен');
+console.log('PORT:', PORT);
+
+if (!TOKEN || !ADMIN_ID) {
+    console.error('❌ Ошибка: Не заданы TOKEN или ADMIN_ID в переменных окружения!');
+    process.exit(1);
+}
+
+const bot = new TelegramBot(TOKEN, { polling: false });
+
+// Health check
 app.get('/health', (req, res) => {
-    res.json({
+    res.status(200).json({
         status: 'OK',
         service: 'Telegram Stars Bot',
         timestamp: new Date().toISOString()
     });
 });
 
-const TOKEN = process.env.TOKEN;
-const ADMIN_ID = process.env.ADMIN_ID;
-const PORT = process.env.PORT || 3000;
-
-console.log('🚀 Настройки:', {
-    hasToken: !!TOKEN,
-    adminId: ADMIN_ID,
-    port: PORT
-});
-
-if (!TOKEN || !ADMIN_ID) {
-    console.error('❌ Ошибка: Нет TOKEN или ADMIN_ID');
-    process.exit(1);
-}
-
-const bot = new TelegramBot(TOKEN, { polling: false });
-
-// Главная страница
 app.get('/', (req, res) => {
     res.json({
         status: 'OK',
@@ -126,12 +124,18 @@ app.post('/notify-payment', async (req, res) => {
     }
 });
 
-// Запуск
-app.listen(PORT, () => {
+// Запуск сервера
+const server = app.listen(PORT, () => {
     console.log(`✅ Сервер запущен на порту ${PORT}`);
     console.log(`📞 Эндпоинты:`);
     console.log(`   GET  / - Проверка`);
     console.log(`   GET  /health - Health check (для Railway)`);
     console.log(`   GET  /get-user?username=... - Поиск`);
     console.log(`   POST /notify-payment - Уведомление`);
+});
+
+// Обработка ошибок при запуске сервера
+server.on('error', (error) => {
+    console.error('❌ Ошибка при запуске сервера:', error);
+    process.exit(1);
 });
