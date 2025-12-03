@@ -2,8 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const sqlite3 = require('sqlite3').verbose(); // Подключаем БД
-const TelegramBot = require('node-telegram-bot-api'); // Подключаем тут сразу
+const sqlite3 = require('sqlite3').verbose();
+const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
 app.use(cors());
@@ -12,51 +12,54 @@ app.use(express.json());
 // --- НАСТРОЙКИ ---
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.TOKEN;
-// Приводим ID к строке для надежного сравнения
-const ADMIN_ID = process.env.ADMIN_ID ? process.env.ADMIN_ID.toString() : null;
+const ADMIN_ID = process.env.ADMIN_ID ? process.env.ADMIN_ID.toString() : '';
 
-// --- ЭКОНОМИКА (Для расчета прибыли) ---
-const PRICE_BUY = 0.015;  // За сколько покупаешь ты ($)
-const PRICE_SELL = 0.017; // За сколько продаешь ($)
-const TX_GAS_COST = 0.05; // Примерная стоимость газа за 2 транзакции (в $)
+// --- ЭКОНОМИКА (Для подсчета прибыли) ---
+const PRICE_BUY = 0.015;  // Цена покупки (Fragment)
+const PRICE_SELL = 0.017; // Твоя цена продажи
+const TX_GAS_COST = 0.05; // Расход на газ (примерно)
+
+console.log('🚀 Запуск сервера...');
 
 // --- БАЗА ДАННЫХ (SQLite) ---
-// Создаем файл базы данных orders.db
 const db = new sqlite3.Database('./orders.db', (err) => {
-    if (err) console.error('❌ Ошибка подключения к БД:', err.message);
+    if (err) console.error('❌ Ошибка БД:', err.message);
     else console.log('✅ База данных подключена');
 });
 
-// Создаем таблицу, если её нет
+// Создаем таблицу заказов
 db.run(`
     CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        user_id TEXT,
-        stars_amount INTEGER,
-        ton_amount REAL,
-        wallet TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                                          id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                          username TEXT,
+                                          stars_amount INTEGER,
+                                          ton_amount REAL,
+                                          wallet TEXT,
+                                          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
 `);
 
 // --- ИНИЦИАЛИЗАЦИЯ БОТА ---
 let bot = null;
+
 if (TOKEN) {
     try {
-        bot = new TelegramBot(TOKEN, { polling: true }); // Включаем polling для приема команд
-        console.log('✅ Бот запущен (Polling)');
+        // ВАЖНО: polling: true заставляет бота слушать команды
+        bot = new TelegramBot(TOKEN, { polling: true });
+        console.log('✅ Бот запущен и слушает команды');
 
-        // === ЛОГИКА АДМИН ПАНЕЛИ ===
+        // === КОМАНДА /ADMIN ===
         bot.onText(/\/admin/, async (msg) => {
             const chatId = msg.chat.id.toString();
 
-            // 1. Проверка на админа
+            // 1. Проверка: ты ли это?
             if (chatId !== ADMIN_ID) {
-                return bot.sendMessage(chatId, '⛔ У вас нет доступа к этой команде.');
+                return bot.sendMessage(chatId, '⛔ Доступ запрещен.');
             }
 
-            // 2. Функция для получения статистики за период
+            console.log(`👑 Админ ${chatId} запросил статистику`);
+
+            // Функция для запроса к БД
             const getStats = (days) => {
                 return new Promise((resolve, reject) => {
                     let query = `
@@ -68,93 +71,94 @@ if (TOKEN) {
                         FROM orders
                     `;
 
-                    // Если days = 0, то берем за все время, иначе добавляем условие времени
+                    // Фильтр по времени (если days > 0)
                     if (days > 0) {
                         query += ` WHERE created_at >= datetime('now', '-${days} days')`;
                     }
 
                     db.get(query, [], (err, row) => {
-                        if (err) reject(err);
-                        else resolve(row || { count: 0, unique_users: 0, total_stars: 0, total_ton: 0 });
+                        if (err) {
+                            reject(err);
+                        } else {
+                            // Если база пустая, row будет, но значения null. Заменяем их на 0.
+                            resolve({
+                                count: row.count || 0,
+                                unique_users: row.unique_users || 0,
+                                total_stars: row.total_stars || 0,
+                                total_ton: row.total_ton || 0
+                            });
+                        }
                     });
                 });
             };
 
             try {
-                // Запрашиваем данные параллельно
+                // Запрашиваем 3 периода одновременно
                 const [week, month, all] = await Promise.all([
-                    getStats(7),  // Неделя
-                    getStats(30), // Месяц
-                    getStats(0)   // Все время
+                    getStats(7),
+                    getStats(30),
+                    getStats(0)
                 ]);
 
-                // 3. Расчет прибыли (на основе данных за все время)
-                // Грязная прибыль = (Цена продажи - Цена покупки) * Кол-во звезд
-                const totalStars = all.total_stars || 0;
-                const grossProfit = totalStars * (PRICE_SELL - PRICE_BUY);
-
-                // Расходы на газ = Кол-во транзакций * Стоимость газа
-                const totalTx = all.count || 0;
-                const totalGas = totalTx * TX_GAS_COST;
-
-                // Чистая прибыль
+                // --- РАСЧЕТ ЧИСТОЙ ПРИБЫЛИ (За все время) ---
+                // Твоя наценка * кол-во звезд
+                const grossProfit = all.total_stars * (PRICE_SELL - PRICE_BUY);
+                // Газ за транзакции
+                const totalGas = all.count * TX_GAS_COST;
+                // Итог
                 const netProfit = grossProfit - totalGas;
 
-                // 4. Формируем сообщение
                 const text = `
-👑 <b>АДМИН ПАНЕЛЬ</b>
+👑 <b>ПАНЕЛЬ ВЛАДЕЛЬЦА</b>
 
 📅 <b>За 7 дней:</b>
-• Продаж: ${week.count} шт.
-• Звезд: <b>${week.total_stars || 0}</b> ⭐️
-• Людей: ${week.unique_users} 👤
-• Оборот: ${(week.total_ton || 0).toFixed(2)} TON 💎
+• Заказов: <code>${week.count}</code>
+• Звезд: <code>${week.total_stars}</code> ⭐️
+• Людей: <code>${week.unique_users}</code> 👤
+• Оборот: <code>${week.total_ton.toFixed(2)}</code> TON 💎
 
 🗓 <b>За 30 дней:</b>
-• Продаж: ${month.count} шт.
-• Звезд: <b>${month.total_stars || 0}</b> ⭐️
-• Людей: ${month.unique_users} 👤
-• Оборот: ${(month.total_ton || 0).toFixed(2)} TON 💎
+• Заказов: <code>${month.count}</code>
+• Звезд: <code>${month.total_stars}</code> ⭐️
+• Людей: <code>${month.unique_users}</code> 👤
+• Оборот: <code>${month.total_ton.toFixed(2)}</code> TON 💎
 
 ♾ <b>ЗА ВСЕ ВРЕМЯ:</b>
-• Всего заказов: ${all.count}
-• Всего звезд: <b>${all.total_stars || 0}</b> ⭐️
-• Общий оборот: <b>${(all.total_ton || 0).toFixed(2)}</b> TON
+• Всего заказов: <code>${all.count}</code>
+• Всего звезд: <code>${all.total_stars}</code> ⭐️
+• Общий объем: <code>${all.total_ton.toFixed(2)}</code> TON 💎
 -----------------------------
-💰 <b>ФИНАНСЫ (Чистыми):</b>
-• Маржа: $${grossProfit.toFixed(2)}
-• Расход на газ: -$${totalGas.toFixed(2)}
-✅ <b>ИТОГ: $${netProfit.toFixed(2)}</b>
+💰 <b>ФИНАНСЫ (Приблиз.):</b>
+• Маржа: <code>$${grossProfit.toFixed(2)}</code>
+• Расход на газ: <code>-$${totalGas.toFixed(2)}</code>
+✅ <b>ЧИСТАЯ ПРИБЫЛЬ: $${netProfit.toFixed(2)}</b>
 `;
                 await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
 
             } catch (e) {
-                console.error('Ошибка админки:', e);
-                bot.sendMessage(chatId, 'Ошибка при расчете статистики.');
+                console.error('Ошибка SQL:', e);
+                bot.sendMessage(chatId, 'Ошибка при чтении базы данных.');
             }
         });
 
     } catch (error) {
-        console.error('❌ Ошибка бота:', error.message);
+        console.error('❌ Ошибка запуска бота:', error.message);
     }
 }
 
-// --- API ЭНДПОИНТЫ ---
+// --- API (ДЛЯ САЙТА) ---
 
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', bot: bot ? 'active' : 'inactive' });
 });
 
 app.get('/get-user', async (req, res) => {
-    // ... (Твой старый код поиска пользователя оставляем без изменений)
-    // Я его сократил тут для удобства чтения, но ты оставь как было
-    // или скопируй из предыдущей версии server.js ту часть, что внутри /get-user
     try {
         const username = req.query.username;
         if (!username) return res.status(400).json({ error: 'No username' });
         const clean = username.replace('@', '').trim();
 
-        // Быстрый поиск через веб
+        // Поиск через веб (быстро и надежно)
         try {
             const resp = await axios.get(`https://t.me/${clean}`);
             const $ = cheerio.load(resp.data);
@@ -163,50 +167,65 @@ app.get('/get-user', async (req, res) => {
             if(!name) throw new Error('No name');
             return res.json({ name, username: clean, photo });
         } catch (e) {
+            // Фолбек: если веб не сработал, пробуем через API бота
+            if (bot) {
+                try {
+                    const chat = await bot.getChat(`@${clean}`);
+                    // Получаем фото
+                    let photoUrl = null;
+                    if (chat.photo) {
+                        photoUrl = await bot.getFileLink(chat.photo.small_file_id);
+                    }
+                    return res.json({
+                        name: chat.first_name || chat.title || clean,
+                        username: clean,
+                        photo: photoUrl
+                    });
+                } catch (botErr) {
+                    return res.status(404).json({ error: 'Not found' });
+                }
+            }
             return res.status(404).json({ error: 'Not found' });
         }
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 4. УВЕДОМЛЕНИЕ ОБ ОПЛАТЕ + СОХРАНЕНИЕ В БД
+// УВЕДОМЛЕНИЕ ОБ ОПЛАТЕ + СОХРАНЕНИЕ
 app.post('/notify-payment', async (req, res) => {
     try {
         const { username, amountStars, amountTon, wallet } = req.body;
 
-        if (!username || !amountStars || !amountTon) {
-            return res.status(400).json({ error: 'No data' });
-        }
+        if (!username || !amountStars) return res.status(400).json({ error: 'No data' });
 
-        console.log(`💰 Оплата: @${username} | ${amountStars} зв. | ${amountTon} TON`);
+        console.log(`💰 New Order: @${username}, ${amountStars} stars`);
 
-        // 1. СОХРАНЯЕМ В БД
+        // 1. Сохраняем в БД
         const stmt = db.prepare(`
-            INSERT INTO orders (username, stars_amount, ton_amount, wallet) 
+            INSERT INTO orders (username, stars_amount, ton_amount, wallet)
             VALUES (?, ?, ?, ?)
         `);
         stmt.run(username, amountStars, amountTon, wallet || 'unknown');
         stmt.finalize();
 
-        // 2. ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ АДМИНУ
+        // 2. Пишем админу
         if (bot && ADMIN_ID) {
             const msg = `
-✅ <b>НОВЫЙ ЗАКАЗ!</b>
-👤 Покупатель: @${username}
+✅ <b>ОПЛАТА ПРОШЛА!</b>
+👤 Клиент: @${username}
 ⭐ Звезды: ${amountStars}
 💎 Сумма: ${amountTon} TON
 👛 Кошелек: <code>${wallet}</code>
 `;
-            bot.sendMessage(ADMIN_ID, msg, { parse_mode: 'HTML' });
+            bot.sendMessage(ADMIN_ID, msg, { parse_mode: 'HTML' }).catch(err => console.error("Не удалось отправить сообщение админу:", err.message));
         }
 
         res.json({ success: true });
-
     } catch (error) {
-        console.error('Payment error:', error);
+        console.error(error);
         res.status(500).json({ error: error.message });
     }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Сервер работает на порту ${PORT}`);
+    console.log(`✅ Server running on port ${PORT}`);
 });
