@@ -10,7 +10,8 @@
     "cors": "^2.8.5",
     "axios": "^1.6.2",
     "cheerio": "^1.0.0-rc.12",
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.64.0",
+    "sqlite3": "^5.1.7"
   },
   "engines": {
     "node": ">=18.0.0"
