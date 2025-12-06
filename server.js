@@ -116,7 +116,6 @@ if (TOKEN) {
                 `👋 <b>Welcome to CocoNet Bot!</b>
 
 Here you can buy <b>Telegram Stars</b> and <b>Premium</b> without Fragment verification using TON.
-Fast, secure, and anonymous.
 
 👇 <b>Please choose your language to continue:</b>`;
 
@@ -130,6 +129,22 @@ Fast, secure, and anonymous.
                         ],
                         // Можно добавить кнопку запуска сразу, но лучше после выбора языка
                         [{ text: '🚀 Open App / Открыть', web_app: { url: 'https://web-production-03b2.up.railway.app' } }]
+                    ]
+                }
+            });
+        });
+
+        bot.onText(/\/language/, (msg) => {
+            const chatId = msg.chat.id;
+
+            bot.sendMessage(chatId, '🌐 <b>Choose your language / Выберите язык:</b>', {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '🇺🇸 English', callback_data: 'set_lang_en' },
+                            { text: '🇷🇺 Русский', callback_data: 'set_lang_ru' }
+                        ]
                     ]
                 }
             });
