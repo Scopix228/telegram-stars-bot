@@ -33,12 +33,12 @@ const db = new sqlite3.Database('./orders.db', (err) => {
 db.serialize(() => {
     db.run(`
         CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            stars_amount INTEGER,
-            ton_amount REAL,
-            wallet TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                                              id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                              username TEXT,
+                                              stars_amount INTEGER,
+                                              ton_amount REAL,
+                                              wallet TEXT,
+                                              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
 
@@ -77,57 +77,88 @@ if (TOKEN) {
 
             // Б) Проверяем, ждем ли мы пост для рассылки от этого юзера
             if (userStates[chatId] === 'WAITING_FOR_BROADCAST') {
-                // Если пользователь передумал и ввел другую команду - сбрасываем
+                // Если пользователь ввел другую команду - сбрасываем режим ожидания
                 if (msg.text && msg.text.startsWith('/')) {
                     delete userStates[chatId];
-                    return; // Дальше обработает обработчик команд
-                }
+                    // Не возвращаем return, чтобы сработал обработчик новой команды ниже
+                } else {
+                    const isAdmin = chatId === ADMIN_ID;
+                    const isMod = MOD_IDS.includes(chatId);
 
-                const isAdmin = chatId === ADMIN_ID;
-                const isMod = MOD_IDS.includes(chatId);
+                    // Очищаем состояние (рассылка разовая)
+                    delete userStates[chatId];
 
-                // Очищаем состояние (рассылка разовая)
-                delete userStates[chatId];
+                    if (isAdmin) {
+                        // АДМИН: Сразу рассылаем
+                        await startCopyBroadcast(chatId, msg.message_id, chatId);
+                    } else if (isMod) {
+                        // МОДЕРАТОР: Отправляем админу на проверку
+                        const broadcastId = Date.now().toString();
 
-                if (isAdmin) {
-                    // АДМИН: Сразу рассылаем это сообщение
-                    await startCopyBroadcast(chatId, msg.message_id, chatId);
-                } else if (isMod) {
-                    // МОДЕРАТОР: Отправляем админу на проверку
-                    const broadcastId = Date.now().toString();
+                        pendingBroadcasts[broadcastId] = {
+                            fromChatId: chatId,
+                            messageId: msg.message_id,
+                            modUsername: username,
+                            modId: chatId
+                        };
 
-                    // Сохраняем данные о сообщении (откуда копировать)
-                    pendingBroadcasts[broadcastId] = {
-                        fromChatId: chatId,
-                        messageId: msg.message_id,
-                        modUsername: username,
-                        modId: chatId
-                    };
+                        // Копируем сообщение Админу
+                        await bot.copyMessage(ADMIN_ID, chatId, msg.message_id);
 
-                    // 1. Копируем сообщение Админу (чтобы он увидел, как оно выглядит)
-                    await bot.copyMessage(ADMIN_ID, chatId, msg.message_id);
-
-                    // 2. Снизу кидаем кнопки
-                    const msgToAdmin = `👮‍♂️ <b>МОДЕРАТОР</b> @${username} хочет сделать рассылку (пост выше).`;
-                    await bot.sendMessage(ADMIN_ID, msgToAdmin, {
-                        parse_mode: 'HTML',
-                        reply_markup: {
-                            inline_keyboard: [
-                                [
-                                    { text: '✅ Одобрить', callback_data: `approve_${broadcastId}` },
-                                    { text: '❌ Отклонить', callback_data: `reject_${broadcastId}` }
+                        // Кнопки для Админа
+                        const msgToAdmin = `👮‍♂️ <b>МОДЕРАТОР</b> @${username} хочет сделать рассылку (пост выше).`;
+                        await bot.sendMessage(ADMIN_ID, msgToAdmin, {
+                            parse_mode: 'HTML',
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [
+                                        { text: '✅ Одобрить', callback_data: `approve_${broadcastId}` },
+                                        { text: '❌ Отклонить', callback_data: `reject_${broadcastId}` }
+                                    ]
                                 ]
-                            ]
-                        }
-                    });
+                            }
+                        });
 
-                    await bot.sendMessage(chatId, '⏳ Пост отправлен на проверку Админу.');
+                        await bot.sendMessage(chatId, '⏳ Пост отправлен на проверку Админу.');
+                    }
+                    return; // Прерываем, так как это был пост для рассылки
                 }
-                return; // Прерываем дальнейшую обработку
             }
         });
 
-        // 2. КОМАНДА /broadcast (Запускает режим ожидания)
+        // --- НОВОЕ: КОМАНДА /help ---
+        bot.onText(/\/help/, (msg) => {
+            const chatId = msg.chat.id.toString();
+            const isAdmin = chatId === ADMIN_ID;
+            const isMod = MOD_IDS.includes(chatId);
+
+            if (!isAdmin && !isMod) return; // Обычным юзерам не отвечаем
+
+            let text = '';
+
+            if (isAdmin) {
+                text = `
+👮‍♂️ <b>Панель Администратора</b>
+
+🔹 <b>/admin</b> — Посмотреть статистику продаж, доход и кол-во пользователей.
+🔹 <b>/broadcast</b> — Начать рассылку.
+   <i>(После ввода команды отправьте боту пост, и он разошлет его всем).</i>
+🔹 <b>/help</b> — Этот список команд.
+`;
+            } else if (isMod) {
+                text = `
+🛡 <b>Панель Модератора</b>
+
+🔸 <b>/broadcast</b> — Предложить рассылку.
+   <i>(После ввода команды отправьте пост. Он уйдет Админу на проверку. Если Админ одобрит — пост увидят все).</i>
+🔸 <b>/help</b> — Этот список команд.
+`;
+            }
+
+            bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+        });
+
+        // 2. КОМАНДА /broadcast
         bot.onText(/\/broadcast$/, async (msg) => {
             const chatId = msg.chat.id.toString();
             const isAdmin = chatId === ADMIN_ID;
@@ -137,13 +168,12 @@ if (TOKEN) {
                 return bot.sendMessage(chatId, '⛔ Нет прав.');
             }
 
-            // Включаем режим ожидания
             userStates[chatId] = 'WAITING_FOR_BROADCAST';
 
-            await bot.sendMessage(chatId, '📢 <b>Режим рассылки активирован.</b>\n\nОтправьте мне следующим сообщением то, что хотите разослать (текст, фото, видео или перешлите готовый пост).', { parse_mode: 'HTML' });
+            await bot.sendMessage(chatId, '📢 <b>Режим рассылки активирован.</b>\n\nОтправьте следующим сообщением <b>текст, фото или видео</b> (или перешлите готовый пост), и он будет отправлен.', { parse_mode: 'HTML' });
         });
 
-        // 3. ОБРАБОТКА КНОПОК АДМИНА
+        // 3. ОБРАБОТКА КНОПОК
         bot.on('callback_query', async (query) => {
             const { data, message } = query;
             const chatId = query.message.chat.id.toString();
@@ -155,20 +185,18 @@ if (TOKEN) {
                 const request = pendingBroadcasts[broadcastId];
 
                 if (request) {
-                    // Удаляем кнопки у админа
                     bot.editMessageText('✅ <b>ОДОБРЕНО. Рассылка запущена.</b>', {
                         chat_id: chatId,
                         message_id: message.message_id,
                         parse_mode: 'HTML'
                     }).catch(() => {});
 
-                    // Запускаем копирование сообщения всем
                     await startCopyBroadcast(request.fromChatId, request.messageId, chatId);
 
                     bot.sendMessage(request.modId, '✅ Ваш пост одобрен и рассылается!');
                     delete pendingBroadcasts[broadcastId];
                 } else {
-                    bot.answerCallbackQuery(query.id, { text: 'Пост уже не актуален' });
+                    bot.answerCallbackQuery(query.id, { text: 'Пост устарел' });
                 }
             }
             else if (data.startsWith('reject_')) {
@@ -188,52 +216,45 @@ if (TOKEN) {
             }
         });
 
-        // --- ФУНКЦИЯ МАССОВОГО КОПИРОВАНИЯ ---
+        // Функция копирования
         async function startCopyBroadcast(fromChatId, messageId, logChatId) {
-            // Берем ВСЕХ пользователей, которые есть в БД на ЭТОТ момент
             db.all("SELECT chat_id FROM users", async (err, rows) => {
                 if (err || !rows || rows.length === 0) {
                     return bot.sendMessage(logChatId, 'Ошибка БД или нет пользователей.');
                 }
 
-                bot.sendMessage(logChatId, `🚀 Начинаю копирование для ${rows.length} пользователей...`);
+                bot.sendMessage(logChatId, `🚀 Рассылка на ${rows.length} чел...`);
 
                 let success = 0;
                 let blocked = 0;
 
                 for (const row of rows) {
                     try {
-                        // copyMessage(куда, откуда, какой_id_сообщения)
                         await bot.copyMessage(row.chat_id, fromChatId, messageId);
                         success++;
-                    } catch (e) {
-                        blocked++;
-                    }
-                    // Пауза 40мс чтобы не словить лимит (около 25 сообщений в секунду)
+                    } catch (e) { blocked++; }
                     await new Promise(r => setTimeout(r, 40));
                 }
 
-                bot.sendMessage(logChatId, `🏁 <b>Готово!</b>\n✅ Доставлено: ${success}\n💀 Недоставлено: ${blocked}`, { parse_mode: 'HTML' });
+                bot.sendMessage(logChatId, `🏁 <b>Готово!</b>\n✅ Доставлено: ${success}\n💀 Блок: ${blocked}`, { parse_mode: 'HTML' });
             });
         }
 
-        // --- СТАРАЯ АДМИНКА ---
+        // 4. КОМАНДА /admin
         bot.onText(/\/admin/, async (msg) => {
             const chatId = msg.chat.id.toString();
-            if (chatId !== ADMIN_ID) return;
+            if (chatId !== ADMIN_ID) return; // Модераторам сюда нельзя
 
             const getStats = (days) => {
                 return new Promise((resolve, reject) => {
                     let query = `SELECT COUNT(*) as count, SUM(stars_amount) as total_stars, SUM(ton_amount) as total_ton FROM orders`;
                     if (days > 0) query += ` WHERE created_at >= datetime('now', '-${days} days')`;
                     db.get(query, [], (err, row) => {
-                        if (err) reject(err);
-                        else resolve(row);
+                        if (err) reject(err); else resolve(row);
                     });
                 });
             };
 
-            // Простой подсчет пользователей
             const getUserCount = () => {
                 return new Promise(resolve => {
                     db.get("SELECT COUNT(*) as count FROM users", [], (err, row) => resolve(row ? row.count : 0));
@@ -244,17 +265,15 @@ if (TOKEN) {
                 const [all, usersCount] = await Promise.all([getStats(0), getUserCount()]);
 
                 const text = `
-👑 <b>АДМИН ПАНЕЛЬ</b>
-👥 <b>Всего юзеров в боте:</b> ${usersCount}
+📊 <b>СТАТИСТИКА БОТА</b>
 
-💰 <b>Продаж за все время:</b> ${all.count || 0}
-⭐ <b>Звезд продано:</b> ${all.total_stars || 0}
-💎 <b>Оборот TON:</b> ${all.total_ton ? all.total_ton.toFixed(2) : 0}
+👥 <b>Пользователей:</b> ${usersCount}
+🛒 <b>Продаж:</b> ${all.count || 0}
+⭐ <b>Всего звёзд:</b> ${all.total_stars || 0}
+💎 <b>Оборот:</b> ${all.total_ton ? all.total_ton.toFixed(2) : 0} TON
 `;
                 await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-            } catch (e) {
-                console.error(e);
-            }
+            } catch (e) { console.error(e); }
         });
 
     } catch (error) {
@@ -263,19 +282,14 @@ if (TOKEN) {
 }
 
 // --- API ---
-app.get('/health', (req, res) => {
-    res.json({ status: 'OK', bot: bot ? 'active' : 'inactive' });
-});
+app.get('/health', (req, res) => { res.json({ status: 'OK', bot: bot ? 'active' : 'inactive' }); });
 
-// GET-USER API
 app.get('/get-user', async (req, res) => {
     try {
         const username = req.query.username;
         if (!username) return res.status(400).json({ error: 'No username' });
         const clean = username.replace('@', '').trim();
         console.log(`🔍 Ищем: @${clean}`);
-
-        // 1. Веб поиск
         try {
             const resp = await axios.get(`https://t.me/${clean}`, { timeout: 5000 });
             const $ = cheerio.load(resp.data);
@@ -283,49 +297,32 @@ app.get('/get-user', async (req, res) => {
             const photo = $('meta[property="og:image"]').attr('content');
             if (name) return res.json({ name, username: clean, photo });
         } catch (e) {}
-
-        // 2. Бот поиск
         if (bot) {
             try {
                 const chat = await bot.getChat(`@${clean}`);
                 let photoUrl = null;
                 if (chat.photo) photoUrl = await bot.getFileLink(chat.photo.small_file_id);
-                return res.json({
-                    name: chat.first_name || chat.title || clean,
-                    username: clean,
-                    photo: photoUrl
-                });
+                return res.json({ name: chat.first_name || chat.title || clean, username: clean, photo: photoUrl });
             } catch (botErr) {}
         }
         return res.status(404).json({ error: 'Not found' });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PAYMENT API
 app.post('/notify-payment', async (req, res) => {
     try {
         const { username, amountStars, amountTon, wallet } = req.body;
         if (!username || !amountStars) return res.status(400).json({ error: 'No data' });
-
         console.log(`💰 ПРОДАЖА: @${username} | ${amountStars} зв.`);
-
         const stmt = db.prepare(`INSERT INTO orders (username, stars_amount, ton_amount, wallet) VALUES (?, ?, ?, ?)`);
         stmt.run(username, amountStars, amountTon, wallet || 'unknown');
         stmt.finalize();
-
         if (bot && ADMIN_ID) {
             const msg = `✅ <b>НОВЫЙ ЗАКАЗ!</b>\n👤 @${username}\n⭐ ${amountStars}\n💎 ${amountTon} TON\n👛 <code>${wallet}</code>`;
             bot.sendMessage(ADMIN_ID, msg, { parse_mode: 'HTML' }).catch(() => {});
         }
-
         res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+    } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Server running on port ${PORT}`);
-});
+app.listen(PORT, '0.0.0.0', () => { console.log(`✅ Server running on port ${PORT}`); });
