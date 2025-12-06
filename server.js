@@ -129,7 +129,6 @@ if (TOKEN) {
                 `👋 <b>Welcome to CocoNet Bot!</b>
 
 Here you can buy <b>Telegram Stars</b> and <b>Premium</b> without Fragment verification using TON.
-Fast, secure, and anonymous.
 
 👇 <b>Please choose your language:</b>`;
 
@@ -208,38 +207,89 @@ Fast, secure, and anonymous.
             await bot.sendMessage(chatId, '📢 <b>Режим рассылки активирован.</b>\n\nОтправьте следующим сообщением <b>текст, фото или видео</b> (или перешлите пост), и он будет обработан.', { parse_mode: 'HTML' });
         });
 
-        // 6. КОМАНДА /admin (Статистика)
+// 6. КОМАНДА /admin (Расширенная статистика)
         bot.onText(/\/admin/, async (msg) => {
             const chatId = msg.chat.id.toString();
             if (chatId !== ADMIN_ID) return;
 
-            const getStats = () => {
-                return new Promise((resolve, reject) => {
-                    let query = `SELECT COUNT(*) as count, SUM(stars_amount) as total_stars, SUM(ton_amount) as total_ton FROM orders`;
-                    db.get(query, [], (err, row) => {
-                        if (err) reject(err); else resolve(row);
-                    });
-                });
-            };
-
-            const getUserCount = () => {
-                return new Promise(resolve => {
-                    db.get("SELECT COUNT(*) as count FROM users", [], (err, row) => resolve(row ? row.count : 0));
-                });
-            };
-
             try {
-                const [all, usersCount] = await Promise.all([getStats(), getUserCount()]);
-                const text = `
-📊 <b>СТАТИСТИКА БОТА</b>
+                // 1. Получаем курс TON к USD (для подсчета в долларах)
+                let tonPrice = 0;
+                try {
+                    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd');
+                    tonPrice = response.data['the-open-network'].usd;
+                } catch (e) {
+                    console.error('Ошибка получения курса:', e.message);
+                    tonPrice = 6.5; // Если API недоступен, берем примерный курс
+                }
 
-👥 <b>Пользователей:</b> ${usersCount}
-🛒 <b>Продаж:</b> ${all.count || 0}
-⭐ <b>Всего звёзд:</b> ${all.total_stars || 0}
-💎 <b>Оборот:</b> ${all.total_ton ? all.total_ton.toFixed(2) : 0} TON
+                // 2. Функция для получения статистики за период
+                const getStats = (period) => {
+                    return new Promise((resolve, reject) => {
+                        let query = `SELECT COUNT(*) as count, SUM(stars_amount) as stars, SUM(ton_amount) as ton FROM orders`;
+
+                        // Если нужен только этот месяц (SQLite синтаксис)
+                        if (period === 'month') {
+                            query += ` WHERE created_at >= date('now','start of month')`;
+                        }
+
+                        db.get(query, [], (err, row) => {
+                            if (err) reject(err);
+                            else resolve({
+                                count: row.count || 0,
+                                stars: row.stars || 0,
+                                ton: row.ton || 0
+                            });
+                        });
+                    });
+                };
+
+                // 3. Получаем кол-во пользователей
+                const getUserCount = () => {
+                    return new Promise(resolve => {
+                        db.get("SELECT COUNT(*) as count FROM users", [], (err, row) => resolve(row ? row.count : 0));
+                    });
+                };
+
+                // Выполняем запросы параллельно
+                const [allTime, monthly, usersCount] = await Promise.all([
+                    getStats('all'),   // За все время
+                    getStats('month'), // За этот месяц
+                    getUserCount()     // Пользователи
+                ]);
+
+                // Считаем USD
+                const totalUsd = (allTime.ton * tonPrice).toFixed(2);
+                const monthUsd = (monthly.ton * tonPrice).toFixed(2);
+                const totalTon = allTime.ton.toFixed(2);
+                const monthTon = monthly.ton.toFixed(2);
+
+                const text = `
+👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>
+
+👥 <b>Аудитория бота:</b> ${usersCount} чел.
+<i>(Пользователи, нажавшие /start)</i>
+
+📅 <b>СТАТИСТИКА ЗА МЕСЯЦ:</b>
+💵 <b>Доход:</b> $${monthUsd}
+💎 <b>В крипте:</b> ${monthTon} TON
+⭐ <b>Звезд продано:</b> ${monthly.stars}
+🛒 <b>Кол-во покупок:</b> ${monthly.count}
+
+📈 <b>ЗА ВСЕ ВРЕМЯ:</b>
+💰 <b>Оборот:</b> $${totalUsd}
+💎 <b>В крипте:</b> ${totalTon} TON
+⭐ <b>Всего звёзд:</b> ${allTime.stars}
+📦 <b>Всего заказов:</b> ${allTime.count}
+
+ℹ️ <i>Курс расчета: 1 TON ≈ $${tonPrice}</i>
 `;
                 await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-            } catch (e) { console.error(e); }
+
+            } catch (e) {
+                console.error(e);
+                bot.sendMessage(chatId, '❌ Ошибка при получении статистики.');
+            }
         });
 
         // 7. ОБРАБОТКА КНОПОК (Язык + Модерация)
