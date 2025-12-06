@@ -227,4 +227,8 @@ app.post('/notify-payment', async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+app.get('/', (req, res) => {
+    res.send('CocoNet Bot Server is Running! 🚀');
+});
+
 app.listen(PORT, '0.0.0.0', () => { console.log(`✅ Server running on port ${PORT}`); });
