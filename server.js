@@ -14,8 +14,7 @@ const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID ? process.env.ADMIN_ID.toString() : '';
 
-// --- НОВОЕ: СПИСОК МОДЕРАТОРОВ ---
-// В Railway добавь переменную MOD_IDS со списком ID через запятую (напр: 123456,789012)
+// Список ID модераторов (через запятую в Variables)
 const MOD_IDS = process.env.MOD_IDS ? process.env.MOD_IDS.split(',').map(id => id.trim()) : [];
 
 // --- ЭКОНОМИКА ---
@@ -32,7 +31,6 @@ const db = new sqlite3.Database('./orders.db', (err) => {
 });
 
 db.serialize(() => {
-    // Таблица заказов (была раньше)
     db.run(`
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,90 +42,108 @@ db.serialize(() => {
         )
     `);
 
-    // --- НОВОЕ: Таблица всех пользователей бота для рассылки ---
+    // Таблица всех пользователей
     db.run(`
         CREATE TABLE IF NOT EXISTS users (
-            chat_id TEXT PRIMARY KEY,
-            username TEXT,
-            joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                                             chat_id TEXT PRIMARY KEY,
+                                             username TEXT,
+                                             joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
 });
 
-// Хранилище для ожидающих подтверждения рассылок (в оперативной памяти)
-const pendingBroadcasts = {};
+// Хранилище временных данных
+const pendingBroadcasts = {}; // Посты на проверке от модераторов
+const userStates = {};        // Состояние пользователя (ждет ли бот пост?)
 
-// --- БОТ И АДМИНКА ---
+// --- БОТ ---
 let bot = null;
 if (TOKEN) {
     try {
         bot = new TelegramBot(TOKEN, { polling: true });
         console.log('✅ Бот запущен');
 
-        // --- НОВОЕ: Сохраняем всех, кто пишет боту /start ---
-        bot.on('message', (msg) => {
-            if (msg.chat.type === 'private') {
-                const chatId = msg.chat.id.toString();
-                const username = msg.from.username || 'unknown';
+        // 1. ЛОВИМ ВСЕ СООБЩЕНИЯ (И для БД, и для Рассылки)
+        bot.on('message', async (msg) => {
+            const chatId = msg.chat.id.toString();
+            const username = msg.from.username || 'unknown';
 
-                // Пытаемся добавить юзера, если его нет (OR IGNORE пропустит, если уже есть)
+            // А) Сохраняем юзера в БД (если новый)
+            if (msg.chat.type === 'private') {
                 const stmt = db.prepare("INSERT OR IGNORE INTO users (chat_id, username) VALUES (?, ?)");
                 stmt.run(chatId, username);
                 stmt.finalize();
             }
+
+            // Б) Проверяем, ждем ли мы пост для рассылки от этого юзера
+            if (userStates[chatId] === 'WAITING_FOR_BROADCAST') {
+                // Если пользователь передумал и ввел другую команду - сбрасываем
+                if (msg.text && msg.text.startsWith('/')) {
+                    delete userStates[chatId];
+                    return; // Дальше обработает обработчик команд
+                }
+
+                const isAdmin = chatId === ADMIN_ID;
+                const isMod = MOD_IDS.includes(chatId);
+
+                // Очищаем состояние (рассылка разовая)
+                delete userStates[chatId];
+
+                if (isAdmin) {
+                    // АДМИН: Сразу рассылаем это сообщение
+                    await startCopyBroadcast(chatId, msg.message_id, chatId);
+                } else if (isMod) {
+                    // МОДЕРАТОР: Отправляем админу на проверку
+                    const broadcastId = Date.now().toString();
+
+                    // Сохраняем данные о сообщении (откуда копировать)
+                    pendingBroadcasts[broadcastId] = {
+                        fromChatId: chatId,
+                        messageId: msg.message_id,
+                        modUsername: username,
+                        modId: chatId
+                    };
+
+                    // 1. Копируем сообщение Админу (чтобы он увидел, как оно выглядит)
+                    await bot.copyMessage(ADMIN_ID, chatId, msg.message_id);
+
+                    // 2. Снизу кидаем кнопки
+                    const msgToAdmin = `👮‍♂️ <b>МОДЕРАТОР</b> @${username} хочет сделать рассылку (пост выше).`;
+                    await bot.sendMessage(ADMIN_ID, msgToAdmin, {
+                        parse_mode: 'HTML',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    { text: '✅ Одобрить', callback_data: `approve_${broadcastId}` },
+                                    { text: '❌ Отклонить', callback_data: `reject_${broadcastId}` }
+                                ]
+                            ]
+                        }
+                    });
+
+                    await bot.sendMessage(chatId, '⏳ Пост отправлен на проверку Админу.');
+                }
+                return; // Прерываем дальнейшую обработку
+            }
         });
 
-        // --- НОВОЕ: Команда рассылки /broadcast текст ---
-        bot.onText(/\/broadcast (.+)/, async (msg, match) => {
+        // 2. КОМАНДА /broadcast (Запускает режим ожидания)
+        bot.onText(/\/broadcast$/, async (msg) => {
             const chatId = msg.chat.id.toString();
-            const textToSend = match[1]; // Текст после команды
-
             const isAdmin = chatId === ADMIN_ID;
             const isMod = MOD_IDS.includes(chatId);
 
             if (!isAdmin && !isMod) {
-                return bot.sendMessage(chatId, '⛔ У вас нет прав.');
+                return bot.sendMessage(chatId, '⛔ Нет прав.');
             }
 
-            // 1. ЕСЛИ АДМИН - ШЛЕМ СРАЗУ
-            if (isAdmin) {
-                await startBroadcast(textToSend, chatId);
-            }
-            // 2. ЕСЛИ МОДЕРАТОР - ШЛЕМ АДМИНУ НА ПРОВЕРКУ
-            else if (isMod) {
-                // Генерируем уникальный ID для этой заявки
-                const broadcastId = Date.now().toString();
-                pendingBroadcasts[broadcastId] = {
-                    text: textToSend,
-                    modUsername: msg.from.username || chatId,
-                    modId: chatId
-                };
+            // Включаем режим ожидания
+            userStates[chatId] = 'WAITING_FOR_BROADCAST';
 
-                const msgToAdmin = `
-👮‍♂️ <b>МОДЕРАТОР ПРЕДЛАГАЕТ РАССЫЛКУ</b>
-👤 От: @${msg.from.username}
-
-📄 <b>Текст:</b>
-${textToSend}
-`;
-                // Отправляем админу с кнопками
-                await bot.sendMessage(ADMIN_ID, msgToAdmin, {
-                    parse_mode: 'HTML',
-                    reply_markup: {
-                        inline_keyboard: [
-                            [
-                                { text: '✅ Подтвердить', callback_data: `approve_${broadcastId}` },
-                                { text: '❌ Отклонить', callback_data: `reject_${broadcastId}` }
-                            ]
-                        ]
-                    }
-                });
-
-                await bot.sendMessage(chatId, '⏳ Ваша рассылка отправлена на проверку Админу.');
-            }
+            await bot.sendMessage(chatId, '📢 <b>Режим рассылки активирован.</b>\n\nОтправьте мне следующим сообщением то, что хотите разослать (текст, фото, видео или перешлите готовый пост).', { parse_mode: 'HTML' });
         });
 
-        // --- НОВОЕ: Обработка кнопок Админа ---
+        // 3. ОБРАБОТКА КНОПОК АДМИНА
         bot.on('callback_query', async (query) => {
             const { data, message } = query;
             const chatId = query.message.chat.id.toString();
@@ -139,83 +155,106 @@ ${textToSend}
                 const request = pendingBroadcasts[broadcastId];
 
                 if (request) {
-                    await bot.editMessageText(`${message.text}\n\n✅ <b>ОДОБРЕНО</b> (Рассылка запущена)`, {
+                    // Удаляем кнопки у админа
+                    bot.editMessageText('✅ <b>ОДОБРЕНО. Рассылка запущена.</b>', {
                         chat_id: chatId,
                         message_id: message.message_id,
                         parse_mode: 'HTML'
-                    });
+                    }).catch(() => {});
 
-                    // Запускаем рассылку
-                    await startBroadcast(request.text, chatId);
+                    // Запускаем копирование сообщения всем
+                    await startCopyBroadcast(request.fromChatId, request.messageId, chatId);
 
-                    // Уведомляем модератора
-                    bot.sendMessage(request.modId, '✅ Вашу рассылку одобрили и запустили!');
-
-                    delete pendingBroadcasts[broadcastId]; // Чистим память
+                    bot.sendMessage(request.modId, '✅ Ваш пост одобрен и рассылается!');
+                    delete pendingBroadcasts[broadcastId];
                 } else {
-                    bot.answerCallbackQuery(query.id, { text: 'Заявка устарела или не найдена' });
+                    bot.answerCallbackQuery(query.id, { text: 'Пост уже не актуален' });
                 }
             }
-
             else if (data.startsWith('reject_')) {
                 const broadcastId = data.split('_')[1];
                 const request = pendingBroadcasts[broadcastId];
 
                 if (request) {
-                    await bot.editMessageText(`${message.text}\n\n❌ <b>ОТКЛОНЕНО</b>`, {
+                    bot.editMessageText('❌ <b>ОТКЛОНЕНО.</b>', {
                         chat_id: chatId,
                         message_id: message.message_id,
                         parse_mode: 'HTML'
-                    });
+                    }).catch(() => {});
 
-                    // Уведомляем модератора
-                    bot.sendMessage(request.modId, '❌ Вашу рассылку отклонили.');
-
+                    bot.sendMessage(request.modId, '❌ Ваш пост был отклонен.');
                     delete pendingBroadcasts[broadcastId];
                 }
             }
         });
 
-        // Функция самой рассылки (получаем всех юзеров из БД)
-        async function startBroadcast(text, adminChatId) {
+        // --- ФУНКЦИЯ МАССОВОГО КОПИРОВАНИЯ ---
+        async function startCopyBroadcast(fromChatId, messageId, logChatId) {
+            // Берем ВСЕХ пользователей, которые есть в БД на ЭТОТ момент
             db.all("SELECT chat_id FROM users", async (err, rows) => {
-                if (err) {
-                    return bot.sendMessage(adminChatId, 'Ошибка при получении списка пользователей.');
+                if (err || !rows || rows.length === 0) {
+                    return bot.sendMessage(logChatId, 'Ошибка БД или нет пользователей.');
                 }
 
-                if (rows.length === 0) {
-                    return bot.sendMessage(adminChatId, 'Пользователей в базе нет (никто еще не нажал /start).');
-                }
+                bot.sendMessage(logChatId, `🚀 Начинаю копирование для ${rows.length} пользователей...`);
 
-                bot.sendMessage(adminChatId, `🚀 Рассылка началась на ${rows.length} пользователей...`);
+                let success = 0;
+                let blocked = 0;
 
-                let successCount = 0;
-                let blockedCount = 0;
-
-                // Проходим по всем пользователям
                 for (const row of rows) {
                     try {
-                        await bot.sendMessage(row.chat_id, text);
-                        successCount++;
+                        // copyMessage(куда, откуда, какой_id_сообщения)
+                        await bot.copyMessage(row.chat_id, fromChatId, messageId);
+                        success++;
                     } catch (e) {
-                        // Пользователь заблокировал бота
-                        blockedCount++;
+                        blocked++;
                     }
-                    // Маленькая задержка, чтобы Телеграм не забанил за спам (30-50мс)
-                    await new Promise(r => setTimeout(r, 50));
+                    // Пауза 40мс чтобы не словить лимит (около 25 сообщений в секунду)
+                    await new Promise(r => setTimeout(r, 40));
                 }
 
-                bot.sendMessage(adminChatId, `🏁 <b>Рассылка завершена!</b>\n✅ Доставлено: ${successCount}\n💀 Заблокировали: ${blockedCount}`, { parse_mode: 'HTML' });
+                bot.sendMessage(logChatId, `🏁 <b>Готово!</b>\n✅ Доставлено: ${success}\n💀 Недоставлено: ${blocked}`, { parse_mode: 'HTML' });
             });
         }
 
-        // --- СТАРАЯ АДМИНКА (оставляем как есть) ---
+        // --- СТАРАЯ АДМИНКА ---
         bot.onText(/\/admin/, async (msg) => {
-            // ... твой старый код админки здесь ...
-            // (Я его скрыл для краткости, но он должен остаться)
             const chatId = msg.chat.id.toString();
-            if (chatId !== ADMIN_ID) return bot.sendMessage(chatId, '⛔ Нет доступа.');
-            // ... логика статистики ...
+            if (chatId !== ADMIN_ID) return;
+
+            const getStats = (days) => {
+                return new Promise((resolve, reject) => {
+                    let query = `SELECT COUNT(*) as count, SUM(stars_amount) as total_stars, SUM(ton_amount) as total_ton FROM orders`;
+                    if (days > 0) query += ` WHERE created_at >= datetime('now', '-${days} days')`;
+                    db.get(query, [], (err, row) => {
+                        if (err) reject(err);
+                        else resolve(row);
+                    });
+                });
+            };
+
+            // Простой подсчет пользователей
+            const getUserCount = () => {
+                return new Promise(resolve => {
+                    db.get("SELECT COUNT(*) as count FROM users", [], (err, row) => resolve(row ? row.count : 0));
+                });
+            };
+
+            try {
+                const [all, usersCount] = await Promise.all([getStats(0), getUserCount()]);
+
+                const text = `
+👑 <b>АДМИН ПАНЕЛЬ</b>
+👥 <b>Всего юзеров в боте:</b> ${usersCount}
+
+💰 <b>Продаж за все время:</b> ${all.count || 0}
+⭐ <b>Звезд продано:</b> ${all.total_stars || 0}
+💎 <b>Оборот TON:</b> ${all.total_ton ? all.total_ton.toFixed(2) : 0}
+`;
+                await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+            } catch (e) {
+                console.error(e);
+            }
         });
 
     } catch (error) {
@@ -224,14 +263,68 @@ ${textToSend}
 }
 
 // --- API ---
-
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', bot: bot ? 'active' : 'inactive' });
 });
 
-// ... ОСТАЛЬНЫЕ API ENDPOINTS (/get-user, /notify-payment) ОСТАВЛЯЕМ БЕЗ ИЗМЕНЕНИЙ ...
-app.get('/get-user', async (req, res) => { /* твой код */ });
-app.post('/notify-payment', async (req, res) => { /* твой код */ });
+// GET-USER API
+app.get('/get-user', async (req, res) => {
+    try {
+        const username = req.query.username;
+        if (!username) return res.status(400).json({ error: 'No username' });
+        const clean = username.replace('@', '').trim();
+        console.log(`🔍 Ищем: @${clean}`);
+
+        // 1. Веб поиск
+        try {
+            const resp = await axios.get(`https://t.me/${clean}`, { timeout: 5000 });
+            const $ = cheerio.load(resp.data);
+            const name = $('div.tgme_page_title').text().trim();
+            const photo = $('meta[property="og:image"]').attr('content');
+            if (name) return res.json({ name, username: clean, photo });
+        } catch (e) {}
+
+        // 2. Бот поиск
+        if (bot) {
+            try {
+                const chat = await bot.getChat(`@${clean}`);
+                let photoUrl = null;
+                if (chat.photo) photoUrl = await bot.getFileLink(chat.photo.small_file_id);
+                return res.json({
+                    name: chat.first_name || chat.title || clean,
+                    username: clean,
+                    photo: photoUrl
+                });
+            } catch (botErr) {}
+        }
+        return res.status(404).json({ error: 'Not found' });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// PAYMENT API
+app.post('/notify-payment', async (req, res) => {
+    try {
+        const { username, amountStars, amountTon, wallet } = req.body;
+        if (!username || !amountStars) return res.status(400).json({ error: 'No data' });
+
+        console.log(`💰 ПРОДАЖА: @${username} | ${amountStars} зв.`);
+
+        const stmt = db.prepare(`INSERT INTO orders (username, stars_amount, ton_amount, wallet) VALUES (?, ?, ?, ?)`);
+        stmt.run(username, amountStars, amountTon, wallet || 'unknown');
+        stmt.finalize();
+
+        if (bot && ADMIN_ID) {
+            const msg = `✅ <b>НОВЫЙ ЗАКАЗ!</b>\n👤 @${username}\n⭐ ${amountStars}\n💎 ${amountTon} TON\n👛 <code>${wallet}</code>`;
+            bot.sendMessage(ADMIN_ID, msg, { parse_mode: 'HTML' }).catch(() => {});
+        }
+
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Server running on port ${PORT}`);
